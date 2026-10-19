@@ -116,6 +116,11 @@ pub mod enrichment;
 /// Optional second-pass reranking of recall results (off by default).
 pub mod reranker;
 
+/// Field updates, supersession, paged listing, per call hybrid recall options
+/// and batched access statistics: the primitives a hosting server needs.
+pub mod hosting;
+pub use hosting::{HybridOptions, MemoryPage, MemoryPatch};
+
 /// Maximal Marginal Relevance: an optional diversity pass over recall results
 /// (off by default; enabled by `CognitiveConfig::mmr_lambda` below 1.0).
 pub(crate) mod mmr;
@@ -168,6 +173,14 @@ pub struct EnrichmentConfig {
     pub entity_merge_threshold: f32,
     /// Embedding similarity below which entities are kept separate. Default: 0.4.
     pub entity_separate_threshold: f32,
+    /// Attribute keys copied from the source memories onto every derived
+    /// memory (facts, entities, communities), so caller supplied provenance
+    /// (a document id, a channel) follows the knowledge derived from it. The
+    /// first source carrying a key wins. Default: none.
+    pub copy_source_attributes: Vec<String>,
+    /// Memory types enrichment reads as candidates. Default: episodic only.
+    /// Derived memories (tagged `source:enrichment`) are never candidates.
+    pub candidate_types: Vec<MemoryType>,
 }
 
 impl Default for EnrichmentConfig {
@@ -180,6 +193,8 @@ impl Default for EnrichmentConfig {
             enable_user_model: false,
             entity_merge_threshold: 0.7,
             entity_separate_threshold: 0.4,
+            copy_source_attributes: Vec::new(),
+            candidate_types: vec![MemoryType::Episodic],
         }
     }
 }
@@ -464,6 +479,19 @@ pub struct CognitiveConfig {
     /// dashboard scope counts (raw turns, action captures, entity index nodes).
     /// The host supplies its own spellings; the engine does not hardcode them.
     pub hidden_count_tags: Vec<String>,
+    /// Result count for an MQL scan plan that carries no LIMIT. The parser
+    /// always fills one in, so this applies to plans built or deserialized
+    /// directly.
+    pub mql_default_limit: usize,
+    /// A memory whose attribute of this name is boolean `true` is exempt from
+    /// decay and archival, like one carrying a `decay_exempt_tags` tag.
+    /// `None` turns the attribute check off. Default: `decay_exempt`.
+    pub decay_exempt_attribute: Option<String>,
+    /// Whether hybrid search hits refresh `accessed_at` and `access_count`.
+    /// Off by default. The refresh is batched in memory and written at the
+    /// next flush, never per hit, so a crash before that flush loses only
+    /// these access statistics.
+    pub refresh_access_on_search: bool,
 }
 
 impl Default for CognitiveConfig {
@@ -512,6 +540,9 @@ impl Default for CognitiveConfig {
             action_keyword_weight: 0.5,
             action_keyword_min_len: 3,
             hidden_count_tags: Vec::new(),
+            mql_default_limit: 20,
+            decay_exempt_attribute: Some("decay_exempt".to_string()),
+            refresh_access_on_search: false,
         }
     }
 }
@@ -726,6 +757,9 @@ pub struct MenteDb {
     last_enrichment_turn: RwLock<u64>,
     /// Whether enrichment is currently pending (set by maintenance trigger).
     enrichment_pending: RwLock<bool>,
+    /// Search hits waiting to have their access statistics written:
+    /// id to (latest access time, hits). Applied at the next flush.
+    pending_access: parking_lot::Mutex<HashMap<MemoryId, (Timestamp, u32)>>,
 }
 
 /// Agent visibility rule for scoped retrieval: a node is visible to an agent
@@ -992,8 +1026,9 @@ impl MenteDb {
             entity_resolver,
             compressor,
             archival,
-            last_enrichment_turn: RwLock::new(0),
+            last_enrichment_turn: RwLock::new(hosting::read_enrichment_watermark(path)),
             enrichment_pending: RwLock::new(false),
+            pending_access: parking_lot::Mutex::new(HashMap::new()),
         })
     }
 
@@ -1864,7 +1899,45 @@ impl MenteDb {
         user: Option<UserId>,
         current_project: Option<&str>,
     ) -> MenteResult<Vec<(MemoryId, f32)>> {
+        self.recall_hybrid_scoped_with(
+            embedding,
+            query_text,
+            k,
+            at,
+            tags,
+            tags_or,
+            time_range,
+            agent,
+            user,
+            current_project,
+            &HybridOptions::default(),
+        )
+    }
+
+    /// [`Self::recall_hybrid_scoped_at_mode`] with per call options: an MMR
+    /// weight and a reranker that override the configured ones for this call
+    /// only, and relevance first selection (see [`HybridOptions`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn recall_hybrid_scoped_with(
+        &self,
+        embedding: &[f32],
+        query_text: Option<&str>,
+        k: usize,
+        at: Timestamp,
+        tags: Option<&[&str]>,
+        tags_or: bool,
+        time_range: Option<(Timestamp, Timestamp)>,
+        agent: Option<AgentId>,
+        user: Option<UserId>,
+        current_project: Option<&str>,
+        opts: &HybridOptions<'_>,
+    ) -> MenteResult<Vec<(MemoryId, f32)>> {
         let started = std::time::Instant::now();
+        let reranker: Option<&dyn crate::reranker::Reranker> =
+            opts.reranker.or(self.reranker.as_deref());
+        let mmr_lambda = opts.mmr_lambda.unwrap_or(self.cognitive_config.mmr_lambda);
+        let decay_on_recall = self.cognitive_config.decay_on_recall;
+        let decay_in_selection = decay_on_recall && !opts.relevance_first;
         debug!(
             "Recall hybrid, k={}, at={}, bm25={}, tags_or={}",
             k,
@@ -1884,9 +1957,8 @@ impl MenteDb {
         // candidate pool so it can promote (or diversify in) a relevant hit the
         // first pass ranked outside the top k; otherwise the usual 3x over-fetch
         // covers results filtered out below.
-        let want_rerank =
-            self.reranker.is_some() && query_text.map(|q| !q.is_empty()).unwrap_or(false);
-        let want_mmr = self.cognitive_config.mmr_lambda < 1.0;
+        let want_rerank = reranker.is_some() && query_text.map(|q| !q.is_empty()).unwrap_or(false);
+        let want_mmr = mmr_lambda < 1.0;
         let fetch_k = if want_rerank || want_mmr {
             k.saturating_mul(self.cognitive_config.rerank_pool_factor.max(1))
         } else {
@@ -1923,6 +1995,8 @@ impl MenteDb {
         // (id, score, content for a reranker, embedding for the MMR pass); the
         // last two are captured only when their stage is active.
         type ScoredCandidate = (MemoryId, f32, Option<String>, Option<Vec<f32>>);
+        let deferred_decay: std::cell::RefCell<HashMap<MemoryId, f32>> =
+            std::cell::RefCell::new(HashMap::new());
         let mut scored: Vec<ScoredCandidate> = resolved
             .into_iter()
             .filter_map(|(id, raw_score, page_id)| {
@@ -1946,12 +2020,19 @@ impl MenteDb {
                 // lets decay affect ranking on this hot path. Blend 70%
                 // similarity with 30% freshly decayed salience, matching the
                 // MQL path, so old, unaccessed memories rank lower.
-                let score = if self.cognitive_config.decay_on_recall {
+                // With relevance first selection the blend is deferred until
+                // the top k are chosen, so decay only reorders within them.
+                let score = if decay_in_selection {
                     let decayed = self.decayed_salience_at(&node, at);
                     raw_score * 0.7 + decayed * 0.3
                 } else {
                     raw_score
                 };
+                if decay_on_recall && !decay_in_selection {
+                    deferred_decay
+                        .borrow_mut()
+                        .insert(id, self.decayed_salience_at(&node, at));
+                }
                 // Weight down a memory that belongs to a DIFFERENT project than
                 // the query's current project. Same-project and global (no
                 // scope:project tag) memories are unaffected, so cross-project
@@ -1988,7 +2069,7 @@ impl MenteDb {
         // reranker over the query text, before the sort cuts to k, so it can lift
         // a candidate the first pass ranked outside the top k.
         if want_rerank
-            && let Some(reranker) = &self.reranker
+            && let Some(reranker) = reranker
             && let Some(qt) = query_text
         {
             use crate::reranker::RerankCandidate;
@@ -2017,7 +2098,7 @@ impl MenteDb {
             // the sorted pool, so near-duplicates do not all fill the budget.
             let rel: Vec<f32> = scored.iter().map(|(_, sc, _, _)| *sc).collect();
             let emb: Vec<Option<&[f32]>> = scored.iter().map(|(_, _, _, e)| e.as_deref()).collect();
-            mmr::mmr_select(&rel, &emb, self.cognitive_config.mmr_lambda, k)
+            mmr::mmr_select(&rel, &emb, mmr_lambda, k)
                 .into_iter()
                 .map(|i| (scored[i].0, scored[i].1))
                 .collect()
@@ -2025,6 +2106,29 @@ impl MenteDb {
             scored.truncate(k);
             scored.into_iter().map(|(id, sc, _, _)| (id, sc)).collect()
         };
+        // Relevance first: the top k were chosen on relevance alone; now blend
+        // in decayed salience and reorder just those.
+        let scored = {
+            let deferred = deferred_decay.into_inner();
+            if deferred.is_empty() {
+                scored
+            } else {
+                let mut blended: Vec<(MemoryId, f32)> = scored
+                    .into_iter()
+                    .map(|(id, sc)| match deferred.get(&id) {
+                        Some(d) => (id, sc * 0.7 + d * 0.3),
+                        None => (id, sc),
+                    })
+                    .collect();
+                blended.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                blended
+            }
+        };
+        // Only searches made on a caller's behalf count as an access; the
+        // engine's own internal recalls pass the default options.
+        if opts.record_access && self.cognitive_config.refresh_access_on_search {
+            self.note_access(scored.iter().map(|(id, _)| *id));
+        }
         // Time only (do not increment recalls here): recall()/query() already
         // count the read, and they reach this hybrid core via execute_plan, so
         // counting here too would double-count them.
@@ -3047,15 +3151,23 @@ impl MenteDb {
         }
     }
 
-    /// Whether a memory is pinned against decay and archival
-    /// (`CognitiveConfig::decay_exempt_tags`).
+    /// Whether a memory is pinned against decay and archival: it carries a
+    /// `CognitiveConfig::decay_exempt_tags` tag, or its
+    /// `CognitiveConfig::decay_exempt_attribute` attribute is boolean `true`.
     pub fn is_decay_exempt(&self, memory: &MemoryNode) -> bool {
-        memory.tags.iter().any(|t| {
+        let tagged = memory.tags.iter().any(|t| {
             self.cognitive_config
                 .decay_exempt_tags
                 .iter()
                 .any(|e| e == t)
-        })
+        });
+        tagged
+            || self
+                .cognitive_config
+                .decay_exempt_attribute
+                .as_ref()
+                .and_then(|key| memory.attributes.get(key))
+                .is_some_and(|v| matches!(v, mentedb_core::memory::AttributeValue::Boolean(true)))
     }
 
     /// Salience decayed to `at`, or the stored salience for a pinned memory.
@@ -3381,6 +3493,7 @@ impl MenteDb {
         // reconciles stale ones against storage), so they are amortized
         // across flush_snapshot_interval hot flushes instead of multiplying
         // fsync cost on every write batch.
+        self.apply_pending_access();
         self.storage.checkpoint()?;
 
         let n = self
@@ -3398,6 +3511,7 @@ impl MenteDb {
     /// than write latency.
     pub fn flush_full(&self) -> MenteResult<()> {
         debug!("Full flush of MenteDB to disk");
+        self.apply_pending_access();
         self.storage.checkpoint()?;
         self.write_snapshots()
     }
@@ -3525,7 +3639,7 @@ impl MenteDb {
                 condition,
                 order_by,
             } => {
-                let k = limit.unwrap_or(20);
+                let k = limit.unwrap_or(self.cognitive_config.mql_default_limit);
                 let mut scored = if tags.is_empty() {
                     // No tag constraint: a bare RECALL, or a metadata-only filter
                     // like `WHERE type = semantic`. Narrow by the browse index
@@ -3562,16 +3676,30 @@ impl MenteDb {
             QueryPlan::TemporalScan {
                 start,
                 end,
+                filters,
+                limit,
                 order_by,
-                ..
             } => {
-                let hits = self
+                let k = limit.unwrap_or(self.cognitive_config.mql_default_limit);
+                // The creation range from the temporal index, intersected with
+                // whatever the bitmap index admits for the other filters.
+                let in_range: std::collections::HashSet<MemoryId> = self
                     .index
-                    .hybrid_search(&[], None, Some((*start, *end)), 100);
-                let mut scored = self.load_scored_memories(&hits)?;
+                    .temporal
+                    .range(*start, *end)
+                    .into_iter()
+                    .collect();
+                let candidates = match self.indexed_candidates(filters) {
+                    Some(ids) => ids.intersection(&in_range).copied().collect(),
+                    None => in_range,
+                };
+                // Every filter, the range ones included, is re-checked on load.
+                let stop_at = if order_by.is_none() { Some(k) } else { None };
+                let mut scored = self.load_matching(Some(&candidates), filters, None, stop_at);
                 if let Some(ob) = order_by {
                     Self::apply_order_by(&mut scored, ob);
                 }
+                scored.truncate(k);
                 Ok(scored)
             }
             QueryPlan::GraphTraversal { start, depth, .. } => {
@@ -3607,15 +3735,13 @@ impl MenteDb {
 
     /// Memories matching the WHERE clause of a tag-less scan, in page order.
     ///
-    /// Equality filters on memory type and tag (`type = x`, `tag = "y"`, and
-    /// `IN` lists of either) are answered from the bitmap index, including the
-    /// reserved type keys, so only candidate pages are loaded; every filter is
-    /// still re-checked on the loaded memory, so the index only narrows. A
-    /// clause with nothing indexable (or an OR/NOT tree) visits every memory.
-    /// With `stop_at` the scan ends as soon as that many memories match.
-    ///
-    /// Page ids are copied out of the page map before any load, so writers
-    /// (which take the page map for writing) never wait on this scan.
+    /// Equality filters on memory type, tag, and owner agent (`type = x`,
+    /// `tag = "y"`, `agent = <uuid>`, and `IN` lists of any of them) are
+    /// answered from the bitmap index, including the reserved type and agent
+    /// keys, so only candidate pages are loaded; every filter is still
+    /// re-checked on the loaded memory, so the index only narrows. A clause
+    /// with nothing indexable (or an OR/NOT tree) visits every memory. With
+    /// `stop_at` the scan ends as soon as that many memories match.
     fn scan_matching(
         &self,
         filters: &[Filter],
@@ -3627,9 +3753,25 @@ impl MenteDb {
         } else {
             None
         };
+        self.load_matching(candidates.as_ref(), filters, condition, stop_at)
+    }
+
+    /// Load the memories among `candidates` (every memory when None) that
+    /// satisfy the WHERE clause, in page order, stopping after `stop_at`
+    /// matches when given.
+    ///
+    /// Page ids are copied out of the page map before any load, so writers
+    /// (which take the page map for writing) never wait on this scan.
+    fn load_matching(
+        &self,
+        candidates: Option<&std::collections::HashSet<MemoryId>>,
+        filters: &[Filter],
+        condition: Option<&Condition>,
+        stop_at: Option<usize>,
+    ) -> Vec<ScoredMemory> {
         let mut pages: Vec<PageId> = {
             let pm = self.page_map.read();
-            match &candidates {
+            match candidates {
                 Some(ids) => ids.iter().filter_map(|id| pm.get(id).copied()).collect(),
                 None => pm.values().copied().collect(),
             }
@@ -3657,10 +3799,12 @@ impl MenteDb {
 
     /// The ids the bitmap index admits for the AND of `filters`, or None when
     /// no filter is answerable from it. Only filters `filter_matches` treats
-    /// as membership tests qualify: type or tag compared with any operator but
-    /// `!=` (which `filter_matches` also reads as equality), or an `IN` list
-    /// whose every element is a type (for type) or text (for tag). Anything
-    /// else is left to the post-load check.
+    /// as membership tests qualify: type, tag, or agent compared with any
+    /// operator but `!=`, or an `IN` list whose every element is a type (for
+    /// type), text (for tag), or UUID (for agent). Any other operator on these
+    /// fields either reads as equality in `filter_matches` (type, tag) or
+    /// matches nothing there (agent), so narrowing by the key never drops a
+    /// match. Anything else is left to the post-load check.
     fn indexed_candidates(
         &self,
         filters: &[Filter],
@@ -3671,6 +3815,9 @@ impl MenteDb {
                     Some(mentedb_index::manager::type_index_key(*t))
                 }
                 (Field::Tag, Value::Text(t)) => Some(t.clone()),
+                (Field::Agent, Value::Uuid(u)) => {
+                    Some(mentedb_index::manager::agent_index_key(AgentId::from(*u)))
+                }
                 _ => None,
             }
         }
@@ -3780,11 +3927,17 @@ impl MenteDb {
     }
 
     /// Whether a memory satisfies a single MQL filter. Applies the metadata
-    /// filters the planner attaches to a plan (type, tag, content, time), so
-    /// `WHERE type = semantic` and similar clauses actually narrow results
-    /// instead of being ignored. Unhandled field/value combinations are
-    /// permissive (they do not exclude), so a supported query is never dropped
-    /// by a clause this does not understand.
+    /// filters the planner attaches to a plan (type, tag, content, owner agent,
+    /// space, salience, confidence, time), so `WHERE type = semantic`,
+    /// `WHERE agent = <uuid>`, `WHERE salience > 0.5` and similar clauses
+    /// actually narrow results instead of being ignored.
+    ///
+    /// `agent` and `space` compare the memory's `agent_id` and `space_id` with
+    /// `=`, `!=`, or `IN`; `salience` and `confidence` compare the stored score
+    /// with `=`, `!=`, `<`, `<=`, `>`, `>=`, or `IN`, at `f32` precision. The
+    /// planner rejects any other operator or value type on these four fields,
+    /// and a plan built around it that still carries one matches nothing.
+    /// Unhandled type, tag, content and time combinations stay permissive.
     fn filter_matches(f: &Filter, node: &MemoryNode) -> bool {
         // IN: the field matches any element of the list (reusing per-field
         // equality, so `type IN [...]`, `tag IN [...]`, `content IN [...]` all work).
@@ -3820,11 +3973,44 @@ impl MenteDb {
             (Field::Accessed, v) => {
                 Self::num_cmp(node.accessed_at as f64, f.op, Self::value_f64(v))
             }
+            (Field::Agent, Value::Uuid(u)) => {
+                Self::id_cmp(node.agent_id == AgentId::from(*u), f.op)
+            }
+            (Field::Space, Value::Uuid(u)) => Self::id_cmp(
+                node.space_id == mentedb_core::types::SpaceId::from(*u),
+                f.op,
+            ),
+            (Field::Agent | Field::Space, _) => false,
+            (Field::Salience, v) => Self::score_cmp(node.salience, f.op, v),
+            (Field::Confidence, v) => Self::score_cmp(node.confidence, f.op, v),
             // AS OF <t>: keep only memories whose validity window contains t.
             (Field::ValidAt, v) => Self::value_f64(v)
                 .map(|t| node.is_valid_at(t as u64))
                 .unwrap_or(true),
             _ => true,
+        }
+    }
+
+    /// An id comparison: `=` (and an `IN` element) keeps a match, `!=` keeps
+    /// a mismatch, and no other operator applies to an id.
+    fn id_cmp(same: bool, op: Operator) -> bool {
+        match op {
+            Operator::Eq | Operator::In => same,
+            Operator::Neq => !same,
+            _ => false,
+        }
+    }
+
+    /// A comparison on an `f32` score (salience, confidence). The literal is
+    /// rounded to `f32` first, so `salience = 0.3` matches a stored `0.3f32`.
+    /// A non-numeric literal or a non-comparison operator matches nothing.
+    fn score_cmp(score: f32, op: Operator, v: &Value) -> bool {
+        if matches!(op, Operator::SimilarTo | Operator::Contains) {
+            return false;
+        }
+        match Self::value_f64(v) {
+            Some(b) => Self::num_cmp(score as f64, op, Some(b as f32 as f64)),
+            None => false,
         }
     }
 
@@ -4404,7 +4590,11 @@ impl MenteDb {
             .filter(|m| {
                 m.agent_id == agent
                     && m.user_id == user
-                    && m.memory_type == mentedb_core::memory::MemoryType::Episodic
+                    && self
+                        .cognitive_config
+                        .enrichment_config
+                        .candidate_types
+                        .contains(&m.memory_type)
                     && !m.tags.contains(&"source:enrichment".to_string())
                     && m.created_at > last_turn
             })
@@ -4447,11 +4637,18 @@ impl MenteDb {
         let mut stored = 0usize;
         let mut edges = 0usize;
 
+        let inherited = self.inherited_attributes(source_ids);
         for mut mem in memories {
             // Tag as enrichment-generated
             if !mem.tags.contains(&"source:enrichment".to_string()) {
                 mem.tags.push("source:enrichment".to_string());
             }
+            let kind = if mem.tags.iter().any(|t| t.starts_with("entity:")) {
+                hosting::DerivedKind::Entity
+            } else {
+                hosting::DerivedKind::Fact
+            };
+            hosting::mark_derived(&mut mem, kind, &inherited);
             // Cap confidence
             if mem.confidence > max_conf {
                 mem.confidence = max_conf;
@@ -4490,6 +4687,11 @@ impl MenteDb {
     /// Mark enrichment as complete for the given turn.
     pub fn mark_enrichment_complete(&self, turn_id: u64) {
         *self.last_enrichment_turn.write() = turn_id;
+        // Persisted so a reopen (or an evicted and reopened database) does
+        // not re-enrich everything since zero.
+        if let Err(e) = hosting::write_enrichment_watermark(&self.path, turn_id) {
+            warn!(error = %e, "persisting the enrichment watermark failed");
+        }
         *self.enrichment_pending.write() = false;
         debug!(turn_id, "enrichment cycle complete");
     }
@@ -4940,6 +5142,17 @@ impl MenteDb {
             .unwrap_or_default()
             .as_micros() as u64;
 
+        // Member entity memories: the summary's sources, for provenance and
+        // for the Derived edges written below.
+        let entity_map = self.build_entity_memory_map(user, agent);
+        let member_sources: Vec<MemoryId> = member_names
+            .iter()
+            .filter_map(|n| entity_map.get(&n.to_lowercase()))
+            .flatten()
+            .copied()
+            .collect();
+        let inherited = self.inherited_attributes(&member_sources);
+
         // Check if a community summary already exists for this category AND both
         // owner axes, so one owner's summary never overwrites another's.
         let community_tag = format!("community:{}", category);
@@ -4954,6 +5167,7 @@ impl MenteDb {
                 // Update existing summary content
                 let mut updated = mem.clone();
                 updated.content = summary.to_string();
+                hosting::mark_derived(&mut updated, hosting::DerivedKind::Community, &inherited);
                 if let Some(ref embedder) = self.embedder {
                     updated.embedding = embedder
                         .embed(summary)
@@ -4984,6 +5198,7 @@ impl MenteDb {
                 "source:enrichment".to_string(),
             ];
             node.confidence = 0.7;
+            hosting::mark_derived(&mut node, hosting::DerivedKind::Community, &inherited);
             let id = node.id;
             self.store(node)?;
             id
@@ -4991,7 +5206,6 @@ impl MenteDb {
 
         // (Re)create Derived edges from summary to member entity memories.
         // On update this refreshes edges to reflect current membership.
-        let entity_map = self.build_entity_memory_map(user, agent);
         for name in member_names {
             let normalized = name.to_lowercase();
             if let Some(member_ids) = entity_map.get(&normalized) {
@@ -5095,6 +5309,7 @@ impl MenteDb {
                 // (a regenerated profile still showed "updated N days ago").
                 let mut updated = mem.clone();
                 updated.content = profile.to_string();
+                hosting::mark_derived(&mut updated, hosting::DerivedKind::Profile, &HashMap::new());
                 updated.created_at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -5124,6 +5339,7 @@ impl MenteDb {
             "source:enrichment".to_string(),
         ];
         node.confidence = 0.8;
+        hosting::mark_derived(&mut node, hosting::DerivedKind::Profile, &HashMap::new());
         let node_id = node.id;
         self.store(node)?;
 
@@ -6084,3 +6300,6 @@ mod reranker_integration_tests {
 
 #[cfg(test)]
 mod scan_tests;
+
+#[cfg(test)]
+mod mql_filter_tests;

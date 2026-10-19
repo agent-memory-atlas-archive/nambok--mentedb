@@ -6,8 +6,8 @@
 mod tls;
 
 use mentedb_server::{
-    auth, cluster, databases, extraction_queue, grpc, maintenance, metrics, rate_limit, routes,
-    state,
+    auth, cluster, databases, extraction_queue, grpc, hosting, maintenance, metrics, rate_limit,
+    routes, state,
 };
 
 use std::env;
@@ -44,6 +44,8 @@ struct ServerConfig {
     llm_provider: Option<String>,
     llm_api_key: Option<String>,
     llm_model: Option<String>,
+    /// Model for judge and rerank calls (--llm-reader-model / MENTEDB_LLM_READER_MODEL).
+    llm_reader_model: Option<String>,
     llm_base_url: Option<String>,
     /// AWS region for the Bedrock provider (MENTEDB_LLM_REGION / AWS_REGION).
     llm_region: Option<String>,
@@ -70,6 +72,7 @@ fn parse_args() -> ServerConfig {
     let mut llm_provider: Option<String> = None;
     let mut llm_api_key: Option<String> = None;
     let mut llm_model: Option<String> = None;
+    let mut llm_reader_model: Option<String> = None;
     let mut llm_base_url: Option<String> = None;
     let mut llm_region: Option<String> = None;
     let mut extraction_quality_threshold: Option<f32> = None;
@@ -173,6 +176,15 @@ fn parse_args() -> ServerConfig {
                     std::process::exit(1);
                 }
             }
+            "--llm-reader-model" => {
+                if i + 1 < args.len() {
+                    llm_reader_model = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Error: --llm-reader-model requires a value");
+                    std::process::exit(1);
+                }
+            }
             "--llm-base-url" => {
                 if i + 1 < args.len() {
                     llm_base_url = Some(args[i + 1].clone());
@@ -263,6 +275,12 @@ fn parse_args() -> ServerConfig {
     {
         llm_model = Some(v);
     }
+    if llm_reader_model.is_none()
+        && let Ok(v) = env::var("MENTEDB_LLM_READER_MODEL")
+        && !v.trim().is_empty()
+    {
+        llm_reader_model = Some(v);
+    }
     if llm_base_url.is_none()
         && let Ok(v) = env::var("MENTEDB_LLM_BASE_URL")
     {
@@ -325,6 +343,7 @@ fn parse_args() -> ServerConfig {
         llm_provider,
         llm_api_key,
         llm_model,
+        llm_reader_model,
         llm_base_url,
         llm_region,
         extraction_quality_threshold,
@@ -402,11 +421,19 @@ fn build_embedder(
                 let region = env::var("MENTEDB_EMBEDDING_REGION")
                     .or_else(|_| env::var("AWS_REGION"))
                     .unwrap_or_else(|_| "us-east-1".to_string());
+                // Whole call timeout per embed (MENTEDB_EMBEDDING_TIMEOUT_MS,
+                // default 3000), so a stalled call fails a write or search
+                // fast instead of holding it open.
+                let timeout = env::var("MENTEDB_EMBEDDING_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map(std::time::Duration::from_millis)
+                    .unwrap_or(mentedb_embedding::bedrock_provider::DEFAULT_EMBED_TIMEOUT);
                 let config = match mentedb_embedding::BedrockEmbeddingConfig::for_model(
                     region.clone(),
                     &model,
                 ) {
-                    Ok(c) => c,
+                    Ok(c) => c.with_timeout(timeout),
                     Err(e) => {
                         eprintln!("Error: --embedding-provider bedrock: {e}");
                         std::process::exit(1);
@@ -528,9 +555,18 @@ async fn main() -> Result<()> {
 
     // TLS: both files or neither. Load and validate before anything binds so
     // a bad certificate fails the start instead of the first handshake.
-    let tls = match tls::resolve(config.tls_cert.clone(), config.tls_key.clone())
-        .and_then(|paths| paths.as_ref().map(tls::load).transpose())
-    {
+    // The PEM material may also come inline through MENTEDB_TLS_CERT_PEM and
+    // MENTEDB_TLS_KEY_PEM (for secret stores that inject values, not files).
+    let tls = match tls::resolve_material(
+        config.tls_cert.clone(),
+        config.tls_key.clone(),
+        env::var("MENTEDB_TLS_CERT_PEM")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
+        env::var("MENTEDB_TLS_KEY_PEM")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
+    ) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -603,7 +639,10 @@ async fn main() -> Result<()> {
     });
 
     let scheme = if tls.is_some() { "https" } else { "http" };
+    // Layers run outermost last: the deadline bounds everything inside it,
+    // and the rate limiter sits inside auth so it can count per token subject.
     let app = routes::build_router(state.clone())
+        .layer(RateLimiter::from_env())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,
@@ -613,7 +652,10 @@ async fn main() -> Result<()> {
             cluster::route,
         ))
         .layer(middleware::from_fn(metrics::track))
-        .layer(RateLimiter::default())
+        .layer(middleware::from_fn_with_state(
+            hosting::hosting_config().request_timeout,
+            hosting::deadline_middleware,
+        ))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());
@@ -621,10 +663,15 @@ async fn main() -> Result<()> {
     println!("MenteDB v{}", env!("CARGO_PKG_VERSION"));
     println!("Data directory: {}", data_dir.display());
     println!("REST API on: {scheme}://0.0.0.0:{port}");
-    println!(
-        "gRPC API on: 0.0.0.0:{grpc_port} ({})",
-        if tls.is_some() { "TLS" } else { "plaintext" }
-    );
+    let grpc_enabled = grpc_enabled(grpc_port, env::var("MENTEDB_GRPC").ok().as_deref());
+    if grpc_enabled {
+        println!(
+            "gRPC API on: 0.0.0.0:{grpc_port} ({})",
+            if tls.is_some() { "TLS" } else { "plaintext" }
+        );
+    } else {
+        println!("gRPC API: off");
+    }
     println!("Auth: {auth_mode}");
     println!();
     println!("REST Endpoints:");
@@ -665,18 +712,22 @@ async fn main() -> Result<()> {
             }
         };
     }
-    let grpc_handle = tokio::spawn(async move {
-        info!("gRPC server listening on {grpc_addr}");
-        grpc_builder
-            .add_service(CognitionServiceServer::new(CognitionServiceImpl {
-                state: grpc_state.clone(),
-            }))
-            .add_service(MemoryServiceServer::new(MemoryServiceImpl {
-                state: grpc_state,
-            }))
-            .serve(grpc_addr)
-            .await
-            .expect("gRPC server failed");
+    let grpc_handle = grpc_enabled.then(|| {
+        tokio::spawn(async move {
+            info!("gRPC server listening on {grpc_addr}");
+            if let Err(e) = grpc_builder
+                .add_service(CognitionServiceServer::new(CognitionServiceImpl {
+                    state: grpc_state.clone(),
+                }))
+                .add_service(MemoryServiceServer::new(MemoryServiceImpl {
+                    state: grpc_state,
+                }))
+                .serve(grpc_addr)
+                .await
+            {
+                tracing::error!(error = %e, "gRPC server failed");
+            }
+        })
     });
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -692,8 +743,11 @@ async fn main() -> Result<()> {
         std::time::Duration::from_secs(config.shutdown_drain_secs),
     )
     .await?;
+    info!("REST server drained; closing databases");
 
-    grpc_handle.abort();
+    if let Some(h) = grpc_handle {
+        h.abort();
+    }
 
     // Drop the extraction sender to signal the worker to drain, then wait
     if let Some(handle) = extraction_handle {
@@ -720,23 +774,68 @@ fn build_verifier(jwt_secret: &Option<String>) -> Result<Option<auth::TokenVerif
     let audience = env::var("MENTEDB_JWT_AUDIENCE")
         .ok()
         .filter(|s| !s.is_empty());
-    let verifier = match env::var("MENTEDB_JWT_PUBLIC_KEY_FILE")
+    let inline_key = env::var("MENTEDB_JWT_PUBLIC_KEY")
         .ok()
-        .filter(|s| !s.is_empty())
-    {
-        Some(path) => {
-            let pem = std::fs::read(&path)
+        .filter(|s| !s.trim().is_empty());
+    let key_file = env::var("MENTEDB_JWT_PUBLIC_KEY_FILE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let public_key = inline_key.is_some() || key_file.is_some();
+    let verifier = match (inline_key, key_file) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "set MENTEDB_JWT_PUBLIC_KEY or MENTEDB_JWT_PUBLIC_KEY_FILE, not both".to_string(),
+            );
+        }
+        (Some(text), None) => Some(
+            auth::TokenVerifier::public_key_text(&text)
+                .map_err(|e| format!("MENTEDB_JWT_PUBLIC_KEY: {e}"))?,
+        ),
+        (None, Some(path)) => {
+            let text = std::fs::read_to_string(&path)
                 .map_err(|e| format!("reading MENTEDB_JWT_PUBLIC_KEY_FILE {path}: {e}"))?;
             Some(
-                auth::TokenVerifier::public_key_pem(&pem)
+                auth::TokenVerifier::public_key_text(&text)
                     .map_err(|e| format!("MENTEDB_JWT_PUBLIC_KEY_FILE {path}: {e}"))?,
             )
         }
-        None => jwt_secret
+        (None, None) => jwt_secret
             .as_deref()
             .map(auth::TokenVerifier::shared_secret),
     };
-    Ok(verifier.map(|v| v.with_issuer_audience(issuer, audience)))
+    let policy = token_policy_from(
+        public_key,
+        env::var("MENTEDB_ALLOW_UNSCOPED_TOKENS").ok().as_deref(),
+        env::var("MENTEDB_JWT_DBS_SUB_PATTERN").ok().as_deref(),
+    );
+    Ok(verifier.map(|v| v.with_issuer_audience(issuer, audience).with_policy(policy)))
+}
+
+/// Token rules: with a public key configured (tokens minted elsewhere, often
+/// one per tenant), a token must carry `dbs` unless
+/// `MENTEDB_ALLOW_UNSCOPED_TOKENS` is on; `MENTEDB_JWT_DBS_SUB_PATTERN` binds
+/// `dbs` to the token's `sub`.
+fn token_policy_from(
+    public_key: bool,
+    allow_unscoped: Option<&str>,
+    sub_pattern: Option<&str>,
+) -> auth::TokenPolicy {
+    let allow = allow_unscoped.is_some_and(env_flag);
+    auth::TokenPolicy {
+        require_dbs: public_key && !allow,
+        dbs_sub_pattern: sub_pattern
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(String::from),
+    }
+}
+
+/// `1`, `true`, `yes` or `on`, any case.
+fn env_flag(v: &str) -> bool {
+    matches!(
+        v.trim().to_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// Limits for named databases from `MENTEDB_MAX_OPEN_DATABASES` and
@@ -763,17 +862,69 @@ fn databases_config_from_env() -> databases::DatabasesConfig {
 /// one, `flag` keeps both valid and records a Contradicts edge. Any other
 /// value is a startup error.
 fn cognitive_config_from_env() -> Result<mentedb::CognitiveConfig, String> {
-    cognitive_config_from(env::var("MENTEDB_CONTRADICTION_POLICY").ok().as_deref())
+    cognitive_config_from(|name| env::var(name).ok())
 }
 
+/// Comma separated list, trimmed, empty entries dropped.
+fn comma_list(v: &str) -> Vec<String> {
+    v.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Engine settings from environment variables, looked up through `get`:
+///
+/// - `MENTEDB_CONTRADICTION_POLICY`: `supersede` or `flag`.
+/// - `MENTEDB_DECAY_EXEMPT_TAGS`: tags whose memories never fade or archive
+///   (replaces the default `scope:always`; include it to keep standing rules
+///   exempt). Standing rule behavior (`/context`, dedup) keys on `scope:always`
+///   itself and does not change with this list.
+/// - `MENTEDB_DECAY_EXEMPT_ATTRIBUTE`: attribute that exempts a memory when
+///   boolean true (default `decay_exempt`; empty turns it off).
+/// - `MENTEDB_ENRICH_COPY_ATTRIBUTES`: attributes derived memories copy from
+///   their sources.
+/// - `MENTEDB_ENRICH_CANDIDATE_TYPES`: memory types enrichment reads
+///   (default `episodic`).
+/// - `MENTEDB_REFRESH_ACCESS_ON_SEARCH`: hybrid search hits refresh access
+///   statistics (written at the next flush).
 fn cognitive_config_from(
-    contradiction_policy: Option<&str>,
+    get: impl Fn(&str) -> Option<String>,
 ) -> Result<mentedb::CognitiveConfig, String> {
     let mut cfg = mentedb::CognitiveConfig::default();
-    if let Some(v) = contradiction_policy.filter(|v| !v.trim().is_empty()) {
+    if let Some(v) = get("MENTEDB_CONTRADICTION_POLICY").filter(|v| !v.trim().is_empty()) {
         cfg.inference_config.contradiction_policy = v
             .parse::<mentedb_cognitive::ContradictionPolicy>()
             .map_err(|e| format!("MENTEDB_CONTRADICTION_POLICY: {e}"))?;
+    }
+    if let Some(v) = get("MENTEDB_DECAY_EXEMPT_TAGS") {
+        cfg.decay_exempt_tags = comma_list(&v);
+    }
+    if let Some(v) = get("MENTEDB_DECAY_EXEMPT_ATTRIBUTE") {
+        let v = v.trim();
+        cfg.decay_exempt_attribute = (!v.is_empty()).then(|| v.to_string());
+    }
+    if let Some(v) = get("MENTEDB_ENRICH_COPY_ATTRIBUTES") {
+        cfg.enrichment_config.copy_source_attributes = comma_list(&v);
+    }
+    if let Some(v) = get("MENTEDB_ENRICH_CANDIDATE_TYPES") {
+        let types = comma_list(&v)
+            .iter()
+            .map(|t| {
+                mentedb_server::handlers::parse_memory_type(
+                    &serde_json::json!({ "memory_type": t }),
+                )
+                .map_err(|_| format!("MENTEDB_ENRICH_CANDIDATE_TYPES: unknown type '{t}'"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if types.is_empty() {
+            return Err("MENTEDB_ENRICH_CANDIDATE_TYPES: name at least one type".into());
+        }
+        cfg.enrichment_config.candidate_types = types;
+    }
+    if let Some(v) = get("MENTEDB_REFRESH_ACCESS_ON_SEARCH") {
+        cfg.refresh_access_on_search = env_flag(&v);
     }
     Ok(cfg)
 }
@@ -828,17 +979,54 @@ fn build_extraction_config(config: &ServerConfig) -> Option<ExtractionConfig> {
             enable_contradiction_check: true,
             enable_deduplication: true,
             extraction_passes: 1,
+            reader_model: config.llm_reader_model.clone(),
             ..ExtractionConfig::default()
         }
         .with_output_env(),
     )
 }
 
+/// Whether the gRPC listener starts: not when `--grpc-port 0` or
+/// `MENTEDB_GRPC` is `off` (also `0`, `false`, `no`, `disabled`).
+fn grpc_enabled(port: u16, toggle: Option<&str>) -> bool {
+    let off = toggle.is_some_and(|v| {
+        matches!(
+            v.trim().to_lowercase().as_str(),
+            "off" | "0" | "false" | "no" | "disabled"
+        )
+    });
+    port != 0 && !off
+}
+
+/// Resolves on Ctrl+C or, on Unix, SIGTERM (what container orchestrators
+/// send before killing a task). The server then stops accepting connections,
+/// lets in-flight requests finish for up to `MENTEDB_SHUTDOWN_DRAIN_SECS`,
+/// and flushes and closes every database.
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen for ctrl+c");
-    info!("received ctrl+c, shutting down");
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %e, "listening for ctrl+c failed");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "listening for SIGTERM failed");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => info!("received ctrl+c, shutting down"),
+        _ = terminate => info!("received SIGTERM, shutting down"),
+    }
 }
 
 #[cfg(test)]
@@ -847,8 +1035,74 @@ mod tests {
     use mentedb_cognitive::ContradictionPolicy;
 
     #[test]
+    fn grpc_can_be_turned_off() {
+        assert!(grpc_enabled(6678, None));
+        assert!(!grpc_enabled(0, None));
+        assert!(!grpc_enabled(6678, Some("off")));
+        assert!(!grpc_enabled(6678, Some("FALSE")));
+        assert!(grpc_enabled(6678, Some("on")));
+    }
+
+    #[test]
+    fn token_policy_requires_dbs_only_with_a_public_key() {
+        assert!(token_policy_from(true, None, None).require_dbs);
+        assert!(!token_policy_from(true, Some("1"), None).require_dbs);
+        assert!(!token_policy_from(false, None, None).require_dbs);
+        assert_eq!(
+            token_policy_from(false, None, Some("tenant.{sub}.*"))
+                .dbs_sub_pattern
+                .as_deref(),
+            Some("tenant.{sub}.*")
+        );
+        assert!(
+            token_policy_from(false, None, Some("  "))
+                .dbs_sub_pattern
+                .is_none()
+        );
+    }
+
+    fn cfg_with(pairs: &[(&str, &str)]) -> Result<mentedb::CognitiveConfig, String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        cognitive_config_from(|k| map.get(k).cloned())
+    }
+
+    #[test]
+    fn engine_settings_from_env() {
+        let d = cfg_with(&[]).unwrap();
+        assert_eq!(d.decay_exempt_tags, vec!["scope:always".to_string()]);
+        assert_eq!(d.decay_exempt_attribute.as_deref(), Some("decay_exempt"));
+        assert!(!d.refresh_access_on_search);
+
+        let c = cfg_with(&[
+            ("MENTEDB_DECAY_EXEMPT_TAGS", "pinned, scope:always ,"),
+            ("MENTEDB_DECAY_EXEMPT_ATTRIBUTE", ""),
+            ("MENTEDB_ENRICH_COPY_ATTRIBUTES", "doc_id,channel"),
+            ("MENTEDB_ENRICH_CANDIDATE_TYPES", "episodic,semantic"),
+            ("MENTEDB_REFRESH_ACCESS_ON_SEARCH", "true"),
+        ])
+        .unwrap();
+        assert_eq!(c.decay_exempt_tags, vec!["pinned", "scope:always"]);
+        assert!(c.decay_exempt_attribute.is_none());
+        assert_eq!(
+            c.enrichment_config.copy_source_attributes,
+            vec!["doc_id", "channel"]
+        );
+        assert_eq!(c.enrichment_config.candidate_types.len(), 2);
+        assert!(c.refresh_access_on_search);
+        assert!(cfg_with(&[("MENTEDB_ENRICH_CANDIDATE_TYPES", "dreams")]).is_err());
+    }
+
+    #[test]
     fn contradiction_policy_from_env_value() {
-        let policy = |v| cognitive_config_from(v).map(|c| c.inference_config.contradiction_policy);
+        let policy = |v: Option<&str>| {
+            let pairs: Vec<(&str, &str)> = v
+                .map(|v| vec![("MENTEDB_CONTRADICTION_POLICY", v)])
+                .unwrap_or_default();
+            cfg_with(&pairs).map(|c| c.inference_config.contradiction_policy)
+        };
         assert_eq!(policy(None), Ok(ContradictionPolicy::Supersede));
         assert_eq!(policy(Some("")), Ok(ContradictionPolicy::Supersede));
         assert_eq!(
